@@ -665,6 +665,273 @@ function Html5XPlayer() {
         return result;
     };
 
+
+    var getResolverHost = function(url) {
+        try {
+            return new URL(url).hostname.replace(/^www\./i, "").toLowerCase();
+        } catch (error) {
+            return "";
+        }
+    };
+
+    var qualityRank = function(label) {
+        var match = String(label || "").match(/(2160|1440|1080|720|576|480|360|240)/);
+        return match ? Number(match[1]) : 0;
+    };
+
+    var orderStreamUrls = function(urls, metadata) {
+        metadata = metadata || {};
+        return urls.slice().sort(function(a, b) {
+            var bMp4 = /\.mp4(?:[?#]|$)/i.test(b) ? 1 : 0;
+            var aMp4 = /\.mp4(?:[?#]|$)/i.test(a) ? 1 : 0;
+            if (bMp4 !== aMp4) return bMp4 - aMp4;
+            return qualityRank(metadata[b] || b) - qualityRank(metadata[a] || a);
+        });
+    };
+
+    var pushResolverUrl = function(urls, value, baseUrl) {
+        var resolved = absoluteResolverUrl(value, baseUrl || value);
+        if (resolved && urls.indexOf(resolved) == -1) urls.push(resolved);
+        return resolved;
+    };
+
+    var extractBalancedArray = function(text, index) {
+        var source = String(text || "");
+        var start = source.indexOf("[", index);
+        if (start < 0) return "";
+
+        var depth = 0;
+        var quote = "";
+        var escaped = false;
+        for (var i = start; i < source.length; i++) {
+            var c = source.charAt(i);
+            if (quote) {
+                if (escaped) {
+                    escaped = false;
+                } else if (c == "\\") {
+                    escaped = true;
+                } else if (c == quote) {
+                    quote = "";
+                }
+            } else if (c == "'" || c == '"') {
+                quote = c;
+            } else if (c == "[") {
+                depth++;
+            } else if (c == "]") {
+                depth--;
+                if (depth === 0) return source.substring(start, i + 1);
+            }
+        }
+
+        return "";
+    };
+
+    var parseJavascriptArray = function(value) {
+        var normalized = String(value || "")
+            .replace(/([{,]\s*)(src|type|label|res|file)\s*:/g, '$1"$2":')
+            .replace(/'/g, '"')
+            .replace(/\\\//g, "/")
+            .replace(/,\s*([}\]])/g, "$1");
+
+        try {
+            return JSON.parse(normalized);
+        } catch (error) {
+            return null;
+        }
+    };
+
+    var extractVidozaUrls = function(html, url) {
+        var urls = [];
+        var metadata = {};
+        var sourcesIndex = String(html || "").search(/sourcesCode\s*:/i);
+        var sources = sourcesIndex >= 0 ? parseJavascriptArray(extractBalancedArray(html, sourcesIndex)) : null;
+
+        if (Array.isArray(sources)) {
+            sources.forEach(function(item) {
+                if (item && (item.src || item.file)) {
+                    var resolved = pushResolverUrl(urls, item.src || item.file, url);
+                    if (resolved) metadata[resolved] = item.res || item.label || "";
+                }
+            });
+        }
+
+        var arrayPatterns = [/sources\s*=\s*(\[[\s\S]*?\])/gi, /sources\s*:\s*(\[[\s\S]*?\])/gi, /"sources"\s*:\s*(\[[\s\S]*?\])/gi];
+        arrayPatterns.forEach(function(pattern) {
+            var match;
+            while ((match = pattern.exec(String(html || ""))) != null) {
+                var parsed = parseJavascriptArray(match[1]);
+                if (Array.isArray(parsed)) {
+                    parsed.forEach(function(item) {
+                        if (item && (item.src || item.file)) pushResolverUrl(urls, item.src || item.file, url);
+                    });
+                }
+            }
+        });
+
+        var attrPatterns = [
+            /file\s*[:=]\s*["'](https?:\/\/[^"']+\.mp4[^"']*)["']/gi,
+            /<source[^>]+src=["']([^"']+)["']/gi,
+            /<video[^>]+src=["']([^"']+)["']/gi
+        ];
+        attrPatterns.forEach(function(pattern) {
+            var match;
+            while ((match = pattern.exec(String(html || ""))) != null) pushResolverUrl(urls, match[1], url);
+        });
+
+        return orderStreamUrls(urls, metadata);
+    };
+
+    var handleVidoza = function(url, run) {
+        return run.fetch(url, {
+            headers: {
+                "user-agent": RESOLVER_USER_AGENT,
+                "referer": url
+            }
+        }).then(function(response) {
+            if (!response.ok) return emptyResolveResult("Vidoza HTTP Error");
+            return response.text().then(function(html) {
+                var urls = extractVidozaUrls(html, url);
+                return urls.length ? {urls: urls, source: "Vidoza Resolver"} : emptyResolveResult("Vidoza No URL");
+            });
+        }).catch(function(error) {
+            if (error instanceof ResolverLimitError) throw error;
+            return emptyResolveResult(error.message);
+        });
+    };
+
+    var normalizeVoeUrl = function(url) {
+        try {
+            var parsed = new URL(url);
+            var parts = parsed.pathname.split("/").filter(Boolean);
+            var id = parts[0] == "e" ? parts[1] : parts[0];
+            if (id) parsed.pathname = "/e/" + id;
+            parsed.search = "";
+            return parsed.toString();
+        } catch (error) {
+            return url;
+        }
+    };
+
+    var findJavascriptRedirect = function(html, baseUrl) {
+        var patterns = [
+            /window\.location\.href\s*=\s*["']([^"']+)["']/i,
+            /window\.location\s*=\s*["']([^"']+)["']/i,
+            /location\.href\s*=\s*["']([^"']+)["']/i,
+            /window\.location\.(?:replace|assign)\(["']([^"']+)["']\)/i
+        ];
+        for (var i = 0; i < patterns.length; i++) {
+            var match = String(html || "").match(patterns[i]);
+            if (match) return absoluteResolverUrl(match[1], baseUrl);
+        }
+        return "";
+    };
+
+    var rot13 = function(input) {
+        return String(input || "").replace(/[a-zA-Z]/g, function(c) {
+            var base = c <= "Z" ? 65 : 97;
+            return String.fromCharCode(((c.charCodeAt(0) - base + 13) % 26) + base);
+        });
+    };
+
+    var base64DecodeWithPadding = function(input) {
+        var value = String(input || "");
+        var pad = value.length % 4;
+        if (pad) value += "=".repeat(4 - pad);
+        return atob(value);
+    };
+
+    var decodeVoeJsonArray = function(rawJson) {
+        try {
+            var arr = JSON.parse(rawJson);
+            if (!Array.isArray(arr) || typeof arr[0] != "string") return null;
+            var value = rot13(arr[0]).replace(/@\$|\^\^|~@|%\?|\*~|!!|#&/g, "");
+            value = base64DecodeWithPadding(value);
+            value = value.split("").map(function(c) {
+                return String.fromCharCode(c.charCodeAt(0) - 3);
+            }).join("");
+            value = value.split("").reverse().join("");
+            value = base64DecodeWithPadding(value);
+            return JSON.parse(value);
+        } catch (error) {
+            return null;
+        }
+    };
+
+    var parseVoePayload = function(rawJson) {
+        try {
+            return JSON.parse(rawJson);
+        } catch (error) {
+            return decodeVoeJsonArray(rawJson);
+        }
+    };
+
+    var extractVoeUrls = function(html, url) {
+        var urls = [];
+        var metadata = {};
+        var scripts = String(html || "").match(/<script\b[^>]*type\s*=\s*["']application\/json["'][^>]*>[\s\S]*?<\/script>/gi) || [];
+
+        scripts.forEach(function(script) {
+            var raw = script.replace(/^<script\b[^>]*>/i, "").replace(/<\/script>$/i, "").trim();
+            var payload = parseVoePayload(cleanResolverText(raw));
+            if (!payload) return;
+
+            if (Array.isArray(payload.fallback)) {
+                payload.fallback.forEach(function(item) {
+                    if (item && item.file) {
+                        var resolved = pushResolverUrl(urls, item.file, url);
+                        if (resolved) metadata[resolved] = item.label || item.type || "";
+                    }
+                });
+            }
+            if (payload.direct_access_url) metadata[pushResolverUrl(urls, payload.direct_access_url, url)] = "direct";
+            if (payload.source) metadata[pushResolverUrl(urls, payload.source, url)] = "auto";
+        });
+
+        var patterns = [
+            /["']hls["']\s*:\s*["'](https?:[^"']+\.m3u8[^"']*)["']/gi,
+            /["']mp4["']\s*:\s*["'](https?:[^"']+\.mp4[^"']*)["']/gi,
+            /hls\s*=\s*["'](https?:[^"']+\.m3u8[^"']*)["']/gi,
+            /mp4\s*=\s*["'](https?:[^"']+\.mp4[^"']*)["']/gi,
+            /sources\s*=\s*\[[\s\S]*?["'](https?:[^"']+\.m3u8[^"']*)["']/gi,
+            /wurl\s*=\s*["'](https?:[^"']+)["']/gi,
+            /["'](https?:[^"']+\.m3u8[^"']*)["']/gi,
+            /["'](https?:[^"']+\.mp4[^"']*)["']/gi,
+            /<source[^>]+src=["']([^"']+)["']/gi,
+            /<video[^>]+src=["']([^"']+)["']/gi
+        ];
+        patterns.forEach(function(pattern) {
+            var match;
+            while ((match = pattern.exec(String(html || ""))) != null) pushResolverUrl(urls, match[1], url);
+        });
+
+        return orderStreamUrls(urls, metadata);
+    };
+
+    var fetchVoeEmbed = function(url, run, redirectsLeft) {
+        return run.fetch(url, {
+            headers: {
+                "user-agent": RESOLVER_USER_AGENT,
+                "referer": url,
+                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            }
+        }).then(function(response) {
+            if (!response.ok) return emptyResolveResult("VOE HTTP Error");
+            return response.text().then(function(html) {
+                var redirectUrl = redirectsLeft > 0 ? findJavascriptRedirect(html, url) : "";
+                if (redirectUrl) return fetchVoeEmbed(redirectUrl, run, redirectsLeft - 1);
+                var urls = extractVoeUrls(html, url);
+                return urls.length ? {urls: urls, source: "VOE Resolver"} : emptyResolveResult("VOE No URL");
+            });
+        });
+    };
+
+    var handleVoe = function(url, run) {
+        return fetchVoeEmbed(normalizeVoeUrl(url), run, 3).catch(function(error) {
+            if (error instanceof ResolverLimitError) throw error;
+            return emptyResolveResult(error.message);
+        });
+    };
+
     var genericScraper = function(url, run) {
         return run.fetch(url, {
             headers: {
@@ -783,6 +1050,8 @@ function Html5XPlayer() {
         if (/arte\.tv/i.test(url)) return Promise.resolve(emptyResolveResult("ARTE Generic Scan Exhausted"));
         if (/3sat\.de/i.test(url)) return Promise.resolve(emptyResolveResult("3sat Generic Scan Exhausted"));
         if (/servustv\.com/i.test(url)) return handleServusTV(url, run);
+        if (/vidoza\.net|videzz\.net/i.test(getResolverHost(url))) return handleVidoza(url, run);
+        if (/^(?:voe\.sx|alejandrocenturyoil\.com|diananatureforeign\.com|heatherwholeinvolve\.com|jennifercertaindevelopment\.com|jilliandescribecompany\.com|jonathansociallike\.com|mariatheserepublican\.com|maxfinishseveral\.com|nathanfromsubject\.com|richardsignfish\.com|robertordercharacter\.com|sarahnewspaperbeat\.com)$/i.test(getResolverHost(url))) return handleVoe(url, run);
         if (/2ix2\.com|phoenix\.de/i.test(url)) return Promise.resolve(emptyResolveResult("Phoenix Generic Scan Exhausted"));
         return Promise.resolve(emptyResolveResult("No provider resolver"));
     };
