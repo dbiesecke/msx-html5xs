@@ -510,6 +510,319 @@ function Html5XPlayer() {
         setupAudioTracks(info);
         setupSubtitleTracks(info, callback);
     };
+
+    //--------------------------------------------------------------------------
+    //Streaming URL Resolver
+    //--------------------------------------------------------------------------
+    var RESOLVER_CONNECTION_LIMIT = 8;
+    var RESOLVER_DEFAULT_TIMEOUT = 3000;
+    var RESOLVER_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+
+    var ResolverLimitError = function() {
+        this.name = "ResolverLimitError";
+        this.message = "Resolver connection limit reached";
+    };
+    ResolverLimitError.prototype = Object.create(Error.prototype);
+    ResolverLimitError.prototype.constructor = ResolverLimitError;
+
+    var hasKnownStreamExtension = function(url) {
+        return /\.(?:m3u8?|mp4)(?:[?#]|$)/i.test(String(url || ""));
+    };
+
+    var createResolverRun = function() {
+        var connections = 0;
+        return {
+            get connections() {
+                return connections;
+            },
+            hasConnections: function() {
+                return connections < RESOLVER_CONNECTION_LIMIT;
+            },
+            fetch: function(url, init) {
+                if (connections >= RESOLVER_CONNECTION_LIMIT) {
+                    return Promise.reject(new ResolverLimitError());
+                }
+                connections++;
+
+                init = init || {};
+                var controller = typeof AbortController != "undefined" ? new AbortController() : null;
+                var timeoutId = controller != null ? setTimeout(function() {
+                    controller.abort();
+                }, RESOLVER_DEFAULT_TIMEOUT) : null;
+                var requestInit = Object.assign({}, init);
+                if (controller != null && requestInit.signal == null) {
+                    requestInit.signal = controller.signal;
+                }
+
+                return fetch(url, requestInit).finally(function() {
+                    if (timeoutId != null) clearTimeout(timeoutId);
+                });
+            }
+        };
+    };
+
+    var cleanResolverText = function(value) {
+        var element = document.createElement("textarea");
+        element.innerHTML = String(value || "");
+        return element.value.trim();
+    };
+
+    var extractResolverAttr = function(tag, attr) {
+        var regex = new RegExp("\\b" + attr + "\\s*=\\s*(['\\\"])(.*?)\\1", "i");
+        var match = String(tag || "").match(regex);
+        if (match) return cleanResolverText(match[2]);
+
+        regex = new RegExp("\\b" + attr + "\\s*=\\s*([^\\s>]+)", "i");
+        match = String(tag || "").match(regex);
+        return match ? cleanResolverText(match[1]) : "";
+    };
+
+    var absoluteResolverUrl = function(value, baseUrl) {
+        if (!TVXTools.isFullStr(value)) return "";
+        try {
+            return new URL(value, baseUrl).toString();
+        } catch (error) {
+            return "";
+        }
+    };
+
+    var emptyResolveResult = function(source) {
+        return {
+            urls: [],
+            source: source,
+            thumbnail: null,
+            favicon: null
+        };
+    };
+
+    var cleanStreamUrl = function(value) {
+        var cleaned = cleanResolverText(value)
+            .replace(/\\"/g, "")
+            .replace(/\\u0026/g, "&")
+            .replace(/["']$/g, "");
+
+        try {
+            return new URL(cleaned).toString();
+        } catch (error) {
+            return "";
+        }
+    };
+
+    var extractStreamUrlsFromText = function(value) {
+        var patterns = [
+            /https?:\/\/[^\s"'<>]+\.mp4[^\s"'<>]*/gi,
+            /https?:\/\/[^\s"'<>]+\.m3u8?[^\s"'<>]*/gi,
+            /"url"\s*:\s*"([^"]+\.mp4[^"]*)"/gi,
+            /"url"\s*:\s*"([^"]+\.m3u8?[^"]*)"/gi,
+            /"src"\s*:\s*"([^"]+\.mp4[^"]*)"/gi,
+            /"src"\s*:\s*"([^"]+\.m3u8?[^"]*)"/gi
+        ];
+        var urls = [];
+
+        patterns.forEach(function(pattern) {
+            var match;
+            while ((match = pattern.exec(String(value || ""))) != null) {
+                var candidate = cleanStreamUrl(match[1] || match[0]);
+                if (candidate && urls.indexOf(candidate) == -1) urls.push(candidate);
+            }
+        });
+
+        return urls;
+    };
+
+    var extractMediaAssetsFromHtml = function(html, url) {
+        var result = {
+            thumbnail: null,
+            favicon: null
+        };
+        var baseUrl;
+
+        try {
+            baseUrl = new URL(url);
+        } catch (error) {
+            return result;
+        }
+
+        var origin = baseUrl.protocol + "//" + baseUrl.host;
+        var linkTags = String(html || "").match(/<link\b[^>]*>/gi) || [];
+        var faviconTag = linkTags.find(function(tag) {
+            return /(?:^|\s)rel\s*=\s*["']?(?:icon|shortcut icon)["']?/i.test(tag);
+        }) || "";
+        var favicon = extractResolverAttr(faviconTag, "href");
+        result.favicon = favicon ? absoluteResolverUrl(favicon, baseUrl.href) : origin + "/favicon.ico";
+
+        var metaTags = String(html || "").match(/<meta\b[^>]*>/gi) || [];
+        for (var i = 0; i < metaTags.length; i++) {
+            var tag = metaTags[i];
+            var property = extractResolverAttr(tag, "property");
+            var name = extractResolverAttr(tag, "name");
+            if (property == "og:image" || name == "twitter:image") {
+                result.thumbnail = absoluteResolverUrl(extractResolverAttr(tag, "content"), baseUrl.href);
+                break;
+            }
+        }
+
+        return result;
+    };
+
+    var genericScraper = function(url, run) {
+        return run.fetch(url, {
+            headers: {
+                "user-agent": RESOLVER_USER_AGENT
+            }
+        }).then(function(response) {
+            if (!response.ok) return emptyResolveResult("HTTP Error");
+            return response.text().then(function(html) {
+                var urls = extractStreamUrlsFromText(html);
+                var mediaAssets = extractMediaAssetsFromHtml(html, url);
+
+                if (urls.length === 0) {
+                    return Object.assign(emptyResolveResult("No URL in HTML"), mediaAssets);
+                }
+
+                var mp4s = urls.filter(function(item) {
+                    return /\.mp4(?:[?#]|$)/i.test(item);
+                });
+                var m3u8s = urls.filter(function(item) {
+                    return /\.m3u8?(?:[?#]|$)/i.test(item);
+                });
+
+                return Object.assign({
+                    urls: mp4s.length ? mp4s : (m3u8s.length ? m3u8s : urls),
+                    source: mp4s.length ? "Generic MP4 Scan" : (m3u8s.length ? "Generic M3U8 Scan" : "Generic Stream Scan")
+                }, mediaAssets);
+            });
+        }).catch(function(error) {
+            if (error instanceof ResolverLimitError) throw error;
+            return emptyResolveResult(error.message);
+        });
+    };
+
+    var deepFindUrl = function(obj) {
+        if (obj == null) return null;
+
+        if (typeof obj == "string") {
+            return /\.m3u8?(?:[?#]|$)|\.mp4(?:[?#]|$)/i.test(obj) ? obj : null;
+        }
+
+        if (Array.isArray(obj)) {
+            for (var i = 0; i < obj.length; i++) {
+                var arrayFound = deepFindUrl(obj[i]);
+                if (arrayFound) return arrayFound;
+            }
+        }
+
+        if (typeof obj == "object") {
+            var directValues = [
+                obj.url,
+                obj.src,
+                obj.path,
+                obj.hls,
+                obj.streamUrl,
+                obj.playback && obj.playback.streams ? obj.playback.streams.url : null
+            ];
+
+            for (var j = 0; j < directValues.length; j++) {
+                var directFound = deepFindUrl(directValues[j]);
+                if (directFound) return directFound;
+            }
+
+            for (var key in obj) {
+                if (Object.prototype.hasOwnProperty.call(obj, key)) {
+                    var nestedFound = deepFindUrl(obj[key]);
+                    if (nestedFound) return nestedFound;
+                }
+            }
+        }
+
+        return null;
+    };
+
+    var handleARD = function(url, run) {
+        var match = String(url).match(/\/video\/([a-zA-Z0-9_-]+)/);
+        if (!match) return Promise.resolve(emptyResolveResult("ARD No ID"));
+
+        return run.fetch("https://api.ardmediathek.de/page-gateway/pages/episode/" + match[1] + "?essential=true", {
+            headers: {
+                "user-agent": "Mozilla/5.0"
+            }
+        }).then(function(response) {
+            if (!response.ok) return emptyResolveResult("ARD API Fail");
+            return response.json().then(function(data) {
+                var streamUrl = deepFindUrl(data);
+                return streamUrl ? {urls: [streamUrl], source: "ARD Deep Scan"} : emptyResolveResult("ARD No URL");
+            });
+        }).catch(function(error) {
+            if (error instanceof ResolverLimitError) throw error;
+            return emptyResolveResult(error.message);
+        });
+    };
+
+    var handleServusTV = function(url, run) {
+        var match = String(url).match(/\/([A-Z0-9]+)/);
+        if (!match) return Promise.resolve(emptyResolveResult("ServusTV No ID"));
+
+        return run.fetch("https://api.on-demand.360app.com/content/" + match[1] + "?site=servus", {
+            headers: {
+                "user-agent": "Mozilla/5.0"
+            }
+        }).then(function(response) {
+            if (!response.ok) return emptyResolveResult("ServusTV No URL");
+            return response.json().then(function(data) {
+                var streamUrl = deepFindUrl(data);
+                return streamUrl ? {urls: [streamUrl], source: "ServusTV API"} : emptyResolveResult("ServusTV No URL");
+            });
+        }).catch(function(error) {
+            if (error instanceof ResolverLimitError) throw error;
+            return emptyResolveResult("ServusTV No URL");
+        });
+    };
+
+    var resolveProviderUrl = function(url, run) {
+        if (/ardmediathek\.de/i.test(url)) return handleARD(url, run);
+        if (/arte\.tv/i.test(url)) return Promise.resolve(emptyResolveResult("ARTE Generic Scan Exhausted"));
+        if (/3sat\.de/i.test(url)) return Promise.resolve(emptyResolveResult("3sat Generic Scan Exhausted"));
+        if (/servustv\.com/i.test(url)) return handleServusTV(url, run);
+        if (/2ix2\.com|phoenix\.de/i.test(url)) return Promise.resolve(emptyResolveResult("Phoenix Generic Scan Exhausted"));
+        return Promise.resolve(emptyResolveResult("No provider resolver"));
+    };
+
+    var resolveStreamUrl = function(url, run) {
+        return genericScraper(url, run).then(function(genericResult) {
+            if (genericResult.urls.length > 0) return genericResult;
+
+            return resolveProviderUrl(url, run).then(function(providerResult) {
+                if (providerResult.urls.length > 0) {
+                    providerResult.thumbnail = providerResult.thumbnail || genericResult.thumbnail;
+                    providerResult.favicon = providerResult.favicon || genericResult.favicon;
+                    return providerResult;
+                }
+                return genericResult;
+            });
+        });
+    };
+
+    var resolveFinalVideoUrl = function(url) {
+        if (!TVXTools.isFullStr(url) || hasKnownStreamExtension(url) || typeof fetch != "function") {
+            return Promise.resolve(url);
+        }
+
+        var run = createResolverRun();
+        return resolveStreamUrl(url, run).then(function(resolved) {
+            if (resolved.urls.length > 0) {
+                TVXVideoPlugin.debug("Resolved video URL with " + resolved.source + " (" + run.connections + "/" + RESOLVER_CONNECTION_LIMIT + ")");
+                return resolved.urls[0];
+            }
+
+            TVXVideoPlugin.warn("Could not resolve final stream URL: " + resolved.source);
+            return url;
+        }).catch(function(error) {
+            var status = error instanceof ResolverLimitError ? "connection limit reached" : error.message;
+            TVXVideoPlugin.warn("Could not resolve final stream URL: " + status);
+            return url;
+        });
+    };
+
     //--------------------------------------------------------------------------
 
     //--------------------------------------------------------------------------
@@ -752,8 +1065,10 @@ function Html5XPlayer() {
         if (TVXTools.isFullStr(url)) {
             TVXVideoPlugin.requestData("video:info", function(data) {
                 setupVideoInfo(data, function() {
-                    player.src = url;
-                    player.load();
+                    resolveFinalVideoUrl(url).then(function(finalUrl) {
+                        player.src = finalUrl;
+                        player.load();
+                    });
                 });
             });
             return true;
